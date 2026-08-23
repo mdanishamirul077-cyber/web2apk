@@ -1,0 +1,179 @@
+name: Flutter ZIP Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ZIP asset URL"
+        required: true
+        type: string
+      userId:
+        description: "Telegram user ID"
+        required: true
+        type: string
+      mode:
+        description: "Build mode"
+        required: true
+        default: "zip"
+        type: string
+      buildType:
+        description: "APK build type"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - debug
+          - release
+      tag:
+        description: "Build tag"
+        required: true
+        default: "manual"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Flutter APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:  
+      - name: Checkout  
+        uses: actions/checkout@v4  
+
+      - name: Setup Java  
+        uses: actions/setup-java@v4  
+        with:  
+          distribution: temurin  
+          java-version: "17"  
+
+      - name: Setup Flutter  
+        uses: subosito/flutter-action@v2  
+        with:  
+          channel: stable  
+          cache: true  
+
+      - name: Download Project ZIP  
+        env:  
+          ZIP_URL: ${{ inputs.jobId }}  
+          GH_TOKEN: ${{ github.token }}  
+        run: |  
+          set -e  
+
+          if [ -z "$ZIP_URL" ]; then  
+            echo "::error::URL ZIP kosong."  
+            exit 1  
+          fi  
+
+          echo "Mengunduh project ZIP..."  
+
+          curl \  
+            --fail \  
+            --location \  
+            --retry 3 \  
+            --retry-delay 3 \  
+            --header "Authorization: Bearer $GH_TOKEN" \  
+            --header "Accept: application/octet-stream" \  
+            "$ZIP_URL" \  
+            --output project.zip  
+
+          if [ ! -s project.zip ]; then  
+            echo "::error::Project ZIP gagal diunduh."  
+            exit 1  
+          fi  
+
+          echo "ZIP berhasil diunduh."  
+
+      - name: Extract Project  
+        run: |  
+          set -e  
+
+          rm -rf project  
+          mkdir -p project  
+
+          unzip -q project.zip -d project  
+
+          echo "Isi project:"  
+          find project -maxdepth 3 -type f | sort | head -200  
+
+      - name: Find Flutter Project  
+        id: project  
+        shell: bash  
+        run: |  
+          set -e  
+
+          PUBSPEC=$(find project \  
+            -name "pubspec.yaml" \  
+            -not -path "*/.git/*" \  
+            | head -n 1)  
+
+          if [ -z "$PUBSPEC" ]; then  
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP."  
+            echo "Pastikan ZIP berisi project Flutter lengkap."  
+            exit 1  
+          fi  
+
+          PROJECT_DIR=$(dirname "$PUBSPEC")  
+
+          echo "Flutter project ditemukan:"  
+          echo "$PROJECT_DIR"  
+
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"  
+
+      - name: Flutter Doctor  
+        working-directory: ${{ steps.project.outputs.dir }}  
+        run: flutter doctor -v  
+
+      - name: Flutter Pub Get  
+        working-directory: ${{ steps.project.outputs.dir }}  
+        run: flutter pub get  
+
+      - name: Build APK  
+        working-directory: ${{ steps.project.outputs.dir }}  
+        env:  
+          BUILD_TYPE: ${{ inputs.buildType }}  
+        run: |  
+          set -e  
+
+          echo "Build type: $BUILD_TYPE"  
+
+          if [ "$BUILD_TYPE" = "debug" ]; then  
+            flutter build apk --debug  
+          elif [ "$BUILD_TYPE" = "release" ]; then  
+            flutter build apk --release  
+          else  
+            echo "::error::Build type tidak valid: $BUILD_TYPE"  
+            exit 1  
+          fi  
+
+      - name: Find APK  
+        working-directory: ${{ steps.project.outputs.dir }}  
+        run: |  
+          set -e  
+
+          echo "APK hasil build:"  
+
+          find build/app/outputs/flutter-apk \  
+            -type f \  
+            -name "*.apk" \  
+            -print  
+
+          APK_COUNT=$(find build/app/outputs/flutter-apk \  
+            -type f \  
+            -name "*.apk" \  
+            | wc -l)  
+
+          if [ "$APK_COUNT" -eq 0 ]; then  
+            echo "::error::APK tidak ditemukan."  
+            exit 1  
+          fi  
+
+      - name: Upload APK Artifact  
+        uses: actions/upload-artifact@v4  
+        with:  
+          name: apk-${{ inputs.buildType }}-${{ inputs.tag }}  
+          path: ${{ steps.project.outputs.dir }}/build/app/outputs/flutter-apk/*.apk  
+          if-no-files-found: error  
+          retention-days: 1
