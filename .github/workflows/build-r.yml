@@ -1,0 +1,347 @@
+name: Flutter ZIP Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ZIP asset URL"
+        required: true
+        type: string
+
+      userId:
+        description: "Telegram user ID"
+        required: true
+        type: string
+
+      mode:
+        description: "Build mode"
+        required: true
+        default: "zip"
+        type: string
+
+      buildType:
+        description: "APK build type"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - debug
+          - release
+
+      tag:
+        description: "Build tag"
+        required: true
+        default: "manual"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Flutter APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Validate Inputs
+        shell: bash
+        env:
+          ZIP_URL: ${{ inputs.jobId }}
+          BUILD_TYPE: ${{ inputs.buildType }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$ZIP_URL" ]; then
+            echo "::error::URL ZIP kosong."
+            exit 1
+          fi
+
+          case "$BUILD_TYPE" in
+            debug|release)
+              ;;
+            *)
+              echo "::error::Build type tidak valid: $BUILD_TYPE"
+              exit 1
+              ;;
+          esac
+
+          if [ "$MODE" != "zip" ]; then
+            echo "::error::Mode tidak valid: $MODE"
+            exit 1
+          fi
+
+          echo "Mode      : $MODE"
+          echo "Build type: $BUILD_TYPE"
+          echo "User ID   : ${{ inputs.userId }}"
+          echo "Tag       : ${{ inputs.tag }}"
+
+      - name: Download Project ZIP
+        shell: bash
+        env:
+          ZIP_URL: ${{ inputs.jobId }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          rm -f project.zip
+
+          echo "Mengunduh project ZIP..."
+
+          if [[ "$ZIP_URL" == https://github.com/* ]] || \
+             [[ "$ZIP_URL" == https://api.github.com/* ]]; then
+
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 5 \
+              --retry-delay 3 \
+              --connect-timeout 30 \
+              --max-time 600 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/octet-stream" \
+              "$ZIP_URL" \
+              --output project.zip
+
+          else
+
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 5 \
+              --retry-delay 3 \
+              --connect-timeout 30 \
+              --max-time 600 \
+              "$ZIP_URL" \
+              --output project.zip
+
+          fi
+
+          if [ ! -s project.zip ]; then
+            echo "::error::Project ZIP kosong atau gagal diunduh."
+            exit 1
+          fi
+
+          FILE_SIZE=$(du -h project.zip | cut -f1)
+
+          echo "ZIP berhasil diunduh."
+          echo "Ukuran ZIP: $FILE_SIZE"
+
+          echo "Memeriksa file ZIP..."
+
+          if ! unzip -tq project.zip >/dev/null 2>&1; then
+            echo "::error::File yang diunduh bukan ZIP yang valid."
+            echo "URL kemungkinan mengarah ke halaman HTML/login, bukan file ZIP."
+            exit 1
+          fi
+
+          echo "ZIP valid."
+
+      - name: Extract Project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf project
+          mkdir -p project
+
+          unzip -q project.zip -d project
+
+          echo "Isi project:"
+          find project -maxdepth 4 -type f | sort | head -300
+
+      - name: Find Flutter Project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBSPEC=$(find project \
+            -type f \
+            -name "pubspec.yaml" \
+            -not -path "*/.git/*" \
+            | head -n 1)
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP."
+            echo ""
+            echo "ZIP harus berisi project Flutter."
+            echo "Contoh:"
+            echo "project/"
+            echo "├── pubspec.yaml"
+            echo "├── lib/"
+            echo "├── android/"
+            echo "└── ..."
+            echo ""
+            echo "Beberapa file pertama:"
+            find project -maxdepth 3 -type f | sort | head -100
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+
+          if [ "$PROJECT_DIR" = "project" ]; then
+            PROJECT_DIR="project"
+          fi
+
+          echo "Flutter project ditemukan:"
+          echo "$PROJECT_DIR"
+
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Check Flutter Project
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f pubspec.yaml ]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
+            exit 1
+          fi
+
+          echo "pubspec.yaml:"
+          head -80 pubspec.yaml
+
+      - name: Flutter Doctor
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          flutter doctor -v
+
+      - name: Flutter Clean
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter clean
+
+      - name: Flutter Pub Get
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ steps.project.outputs.dir }}
+        env:
+          BUILD_TYPE: ${{ inputs.buildType }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Build type: $BUILD_TYPE"
+
+          case "$BUILD_TYPE" in
+            debug)
+              flutter build apk --debug
+              ;;
+
+            release)
+              flutter build apk --release
+              ;;
+
+            *)
+              echo "::error::Build type tidak valid: $BUILD_TYPE"
+              exit 1
+              ;;
+          esac
+
+      - name: Find APK
+        id: apk
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_DIR="build/app/outputs/flutter-apk"
+
+          if [ ! -d "$APK_DIR" ]; then
+            echo "::error::Folder output APK tidak ditemukan: $APK_DIR"
+            exit 1
+          fi
+
+          echo "APK hasil build:"
+
+          find "$APK_DIR" \
+            -type f \
+            -name "*.apk" \
+            -print
+
+          APK=$(find "$APK_DIR" \
+            -type f \
+            -name "*.apk" \
+            | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan."
+            exit 1
+          fi
+
+          APK_NAME=$(basename "$APK")
+          APK_SIZE=$(du -h "$APK" | cut -f1)
+
+          echo "APK ditemukan:"
+          echo "$APK"
+
+          echo "Nama : $APK_NAME"
+          echo "Ukuran: $APK_SIZE"
+
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "name=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare APK Artifact
+        shell: bash
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          BUILD_TYPE: ${{ inputs.buildType }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifact
+
+          SAFE_TAG=$(printf '%s' "$TAG" | tr -cd '[:alnum:]_.-' | cut -c1-80)
+
+          if [ -z "$SAFE_TAG" ]; then
+            SAFE_TAG="manual"
+          fi
+
+          APK_NAME="app-${BUILD_TYPE}-${SAFE_TAG}.apk"
+
+          cp "$APK_PATH" "artifact/$APK_NAME"
+
+          echo "Artifact:"
+          ls -lh artifact/
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.buildType }}-${{ inputs.tag }}
+          path: artifact/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
